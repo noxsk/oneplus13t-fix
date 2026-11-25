@@ -1,35 +1,40 @@
 name: "Update Module"
 
-# Refreshes module/odm with the blobs from a ColorOS OTA, then hands the
+# Refreshes module/odm with blobs from a ColorOS Full OTA, then hands the
 # release itself over to the "Release Module" workflow.
 
 on:
   workflow_dispatch:
     inputs:
       oos_version:
-        description: "Target OOS Version (e.g., CPH2723_16.0.1.303)"
+        description: "Target OOS Version (e.g., CPH2723_17.0.1.201)"
         required: true
         type: string
       version_suffix:
-        description: "Optional Suffix (e.g., _v2)"
+        description: "Optional Suffix (e.g., -r2)"
         required: false
         default: ""
         type: string
-      oos_ota_url:
-        description: "Source OOS Full OTA URL"
-        required: true
-        type: string
       cos_version:
-        description: "Source COS Version (e.g., PKX110_16.0.1.301)"
+        description: "Source COS Version (e.g., PKX110_17.0.1.201)"
         required: true
         type: string
       cos_ota_url:
         description: "Source COS Full OTA URL"
         required: true
         type: string
+      cos_ota_md5:
+        description: "Optional MD5 checksum for COS Full OTA verification"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: update-module-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   check-tag:
@@ -39,20 +44,26 @@ jobs:
       exists: ${{ steps.check.outputs.exists }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository metadata
         uses: actions/checkout@v4
+        with:
+          sparse-checkout: README.md
 
       - name: Check if release tag exists
         id: check
+        env:
+          OOS_VERSION: ${{ inputs.oos_version }}
+          VERSION_SUFFIX: ${{ inputs.version_suffix }}
         run: |
-          release_tag="${{ inputs.oos_version }}${{ inputs.version_suffix }}"
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          release_tag="${OOS_VERSION}${VERSION_SUFFIX}"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
 
-          if git ls-remote --tags origin | grep -q "refs/tags/${release_tag}$"; then
-            echo "Skipping: tag $release_tag already exists."
+          if git ls-remote --tags origin "refs/tags/${release_tag}" | grep -q "refs/tags/${release_tag}$"; then
+            echo "Skipping: tag ${release_tag} already exists."
             echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Skipped update: tag \`${release_tag}\` already exists." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Tag $release_tag is new."
+            echo "Tag ${release_tag} is new."
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -69,94 +80,99 @@ jobs:
         with:
           ref: ${{ github.ref_name }}
 
-      - name: Prepare environment
+      - name: Setup extraction paths
+        run: |
+          WORK_DIR=$(mktemp -d -t odmwork.XXXXXX)
+          echo "WORK_DIR=${WORK_DIR}" >> "$GITHUB_ENV"
+          echo "MOUNT_POINT=${WORK_DIR}/erofs_mount" >> "$GITHUB_ENV"
+
+      - name: Free disk space & install dependencies
         run: |
           cleanup_disk() {
             echo "Cleaning up disk space..."
             sudo rm -rf /usr/share/dotnet
             sudo rm -rf /opt/ghc
             sudo rm -rf /usr/local/lib/android
-            sudo rm -rf "/usr/local/share/boost"
+            sudo rm -rf /usr/local/share/boost
             sudo rm -rf "$AGENT_TOOLSDIRECTORY"
             sudo systemctl stop docker || true
             sudo rm -rf /var/lib/docker
             sudo rm -rf /usr/share/docker-desktop
           }
 
-          download_otas() {
-            echo "Downloading OTA packages..."
-            mkdir -p OTA_zip
-
-            aria2c -x16 -s16 -k1M --file-allocation=none -c -d OTA_zip -o "oos.zip" "${{ inputs.oos_ota_url }}" &
-            PID_OOS=$!
-
-            aria2c -x16 -s16 -k1M --file-allocation=none -c -d OTA_zip -o "cos.zip" "${{ inputs.cos_ota_url }}" &
-            PID_COS=$!
-
-            wait $PID_OOS || { echo "OOS download failed!"; exit 1; }
-            wait $PID_COS || { echo "COS download failed!"; exit 1; }
-          }
-
           cleanup_disk &
           CLEANUP_PID=$!
-          download_otas
 
-          wait $CLEANUP_PID
-          ls -lh OTA_zip/
-          df -h
-
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y \
-            jq aria2 erofs-utils erofsfuse \
-            brotli lz4 xz-utils unzip zip
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            aria2 erofs-utils erofsfuse xz-utils unzip
 
           echo "Installing payload-dumper-go..."
           PD_URL="https://github.com/ssut/payload-dumper-go/releases/download/1.3.0/payload-dumper-go_1.3.0_linux_amd64.tar.gz"
-          curl -sL "$PD_URL" -o dumper.tar.gz
-          tar -xzf dumper.tar.gz
-          sudo mv payload-dumper-go /usr/local/bin/payload-dumper-go
-          rm dumper.tar.gz
+          curl -fsSL --retry 3 "$PD_URL" -o "${RUNNER_TEMP}/dumper.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/dumper.tar.gz" -C "${RUNNER_TEMP}" payload-dumper-go
+          sudo install -m 0755 "${RUNNER_TEMP}/payload-dumper-go" /usr/local/bin/payload-dumper-go
+          rm -f "${RUNNER_TEMP}/dumper.tar.gz" "${RUNNER_TEMP}/payload-dumper-go"
 
-      - name: Setup extraction paths
+          wait "$CLEANUP_PID"
+          df -h
+
+      - name: Download COS Full OTA
+        env:
+          COS_OTA_URL: ${{ inputs.cos_ota_url }}
+          COS_OTA_MD5: ${{ inputs.cos_ota_md5 }}
         run: |
-          WORK_DIR=$(mktemp -d -t odmwork.XXXXXX)
+          echo "Downloading ColorOS OTA package..."
+          aria2c \
+            -x16 -s16 -k1M \
+            --file-allocation=none \
+            --max-tries=5 --retry-wait=3 \
+            -c -d "${WORK_DIR}" -o "cos.zip" \
+            "$COS_OTA_URL"
 
-          echo "WORK_DIR=${WORK_DIR}" >> "$GITHUB_ENV"
-          echo "MOUNT_POINT=${WORK_DIR}/erofs_mount" >> "$GITHUB_ENV"
+          ls -lh "${WORK_DIR}/cos.zip"
 
-      - name: Extract ODM images
+          if [ -n "$COS_OTA_MD5" ]; then
+            expected_md5=$(printf '%s' "$COS_OTA_MD5" | tr '[:upper:]' '[:lower:]')
+            actual_md5=$(md5sum "${WORK_DIR}/cos.zip" | awk '{print $1}')
+            echo "MD5 check: expected=${expected_md5} actual=${actual_md5}"
+            if [ "$actual_md5" != "$expected_md5" ]; then
+              echo "::error::COS OTA MD5 mismatch (expected ${expected_md5}, got ${actual_md5})"
+              exit 1
+            fi
+          fi
+
+      - name: Extract COS ODM image
         run: |
           source .github/scripts/extract_odm_lib.sh
-
-          WORK_DIR="${{ env.WORK_DIR }}"
-
-          extract_and_clean "OTA_zip/oos.zip" "odm_oos.img" "$WORK_DIR"
-          extract_and_clean "OTA_zip/cos.zip" "odm_cos.img" "$WORK_DIR"
-
-          echo "odm_img_path=$WORK_DIR/odm_cos.img" >> "$GITHUB_ENV"
+          extract_and_clean "${WORK_DIR}/cos.zip" "odm_cos.img" "${WORK_DIR}"
+          echo "odm_img_path=${WORK_DIR}/odm_cos.img" >> "$GITHUB_ENV"
 
       - name: Update ODM files
+        env:
+          COS_VERSION: ${{ inputs.cos_version }}
         run: |
           source .github/scripts/extract_odm_lib.sh
 
-          MOUNT_POINT="${{ env.MOUNT_POINT }}"
           REPO_ODM_ROOT="module/odm"
           HISTORY_FILE=".github/logs/odm_changes.md"
-          CURRENT_REPORT="current_report.txt"
+          CURRENT_REPORT="${WORK_DIR}/current_report.txt"
 
-          mount_odm "${{ env.odm_img_path }}" "$MOUNT_POINT"
+          trap 'unmount_odm "$MOUNT_POINT" 2>/dev/null || true' EXIT
+          mount_odm "${odm_img_path}" "$MOUNT_POINT"
 
           {
-            echo "## Update: $RELEASE_TAG"
-            echo "- **Date:** $(date)"
-            echo "- **Source COS:** ${{ inputs.cos_version }}"
+            echo "## Update: ${RELEASE_TAG}"
+            echo "- **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- **Source COS:** ${COS_VERSION}"
             echo "- **Changes:**"
             echo '```diff'
           } > "$CURRENT_REPORT"
 
-          find "$REPO_ODM_ROOT" -type f | sort | while read -r LOCAL_FILE; do
+          updated_count=0
+          missing_count=0
+
+          while IFS= read -r LOCAL_FILE; do
             REL_PATH="${LOCAL_FILE#"$REPO_ODM_ROOT"/}"
             SOURCE_FILE="$MOUNT_POINT/$REL_PATH"
 
@@ -164,11 +180,17 @@ jobs:
               if ! cmp -s "$LOCAL_FILE" "$SOURCE_FILE" 2>/dev/null; then
                 cp -Pf "$SOURCE_FILE" "$LOCAL_FILE"
                 echo "! [UPDATED]   $REL_PATH" >> "$CURRENT_REPORT"
+                updated_count=$((updated_count + 1))
               fi
             else
               echo "- [MISSING]   $REL_PATH" >> "$CURRENT_REPORT"
+              missing_count=$((missing_count + 1))
             fi
-          done
+          done < <(find "$REPO_ODM_ROOT" -type f | sort)
+
+          if [ "$updated_count" -eq 0 ] && [ "$missing_count" -eq 0 ]; then
+            echo "# No ODM file changes detected" >> "$CURRENT_REPORT"
+          fi
 
           {
             echo '```'
@@ -176,22 +198,38 @@ jobs:
           } >> "$CURRENT_REPORT"
 
           touch "$HISTORY_FILE"
-          cat "$CURRENT_REPORT" "$HISTORY_FILE" > temp && mv temp "$HISTORY_FILE"
+          cat "$CURRENT_REPORT" "$HISTORY_FILE" > "${WORK_DIR}/odm_changes.tmp"
+          mv "${WORK_DIR}/odm_changes.tmp" "$HISTORY_FILE"
 
           cat "$CURRENT_REPORT"
+          {
+            echo "### ODM Sync Summary"
+            echo "- Updated: **${updated_count}**"
+            echo "- Missing: **${missing_count}**"
+            echo
+            cat "$CURRENT_REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           unmount_odm "$MOUNT_POINT"
 
       - name: Cleanup temporary files
-        run: rm -rf "${{ env.WORK_DIR }}" OTA_zip
+        if: always()
+        run: |
+          if [ -n "${WORK_DIR:-}" ]; then
+            rm -rf "$WORK_DIR"
+          fi
 
       - name: Commit ODM changes
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add module/odm .github/logs/odm_changes.md
-          git commit -m "feat: update ODM for $RELEASE_TAG"
-          git push
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: update ODM for ${RELEASE_TAG}"
+            git push
+          else
+            echo "No ODM changes to commit."
+          fi
 
   release:
     needs: [check-tag, update-odm]
@@ -210,21 +248,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout log directory
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
+          sparse-checkout: .github/logs
 
-      - name: Install yq
+      - name: Ensure yq is available
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          if ! yq --version 2>&1 | grep -qi 'mikefarah'; then
+            curl -fsSL --retry 3 \
+              "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" \
+              -o "${RUNNER_TEMP}/yq"
+            sudo install -m 0755 "${RUNNER_TEMP}/yq" /usr/local/bin/yq
+            rm -f "${RUNNER_TEMP}/yq"
+          fi
 
       - name: Update OTA history
         env:
           TAG_VER: ${{ needs.check-tag.outputs.release_tag }}
           COS_VER: ${{ inputs.cos_version }}
         run: |
+          mkdir -p .github/logs
           [ -f .github/logs/ota_history.yml ] || echo "[]" > .github/logs/ota_history.yml
 
           TS=$(date -u --iso-8601=seconds)
@@ -236,8 +281,8 @@ jobs:
             "processed_at": env(TS)
           }]' .github/logs/ota_history.yml
 
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add .github/logs/ota_history.yml
-          git commit -m "chore: update OTA history for $TAG_VER [skip ci]"
+          git commit -m "chore: update OTA history for ${TAG_VER} [skip ci]"
           git push

@@ -1,0 +1,95 @@
+name: "Build & Verify Module"
+
+# Validates module metadata, scripts, bind-mount targets, and builds the
+# module ZIP artifact on every push / PR without publishing a release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate module metadata and JSON
+        run: |
+          for key in id name version versionCode author description updateJson; do
+            grep -q "^${key}=" module/module.prop || {
+              echo "::error::Missing required key '${key}' in module/module.prop"
+              exit 1
+            }
+          done
+
+          jq -e '.version and .versionCode and .zipUrl and .changelog' update.json >/dev/null
+
+      - name: Validate shell scripts
+        run: |
+          sh -n module/post-fs-data.sh
+          bash -n .github/scripts/extract_odm_lib.sh
+          shellcheck .github/scripts/extract_odm_lib.sh
+
+      - name: Verify bind-mount sources exist in module/
+        run: |
+          missing=0
+          while IFS= read -r rel_path; do
+            target="module/${rel_path}"
+            if [ ! -e "$target" ]; then
+              echo "::error::Bind-mount source missing: ${target}"
+              missing=$((missing + 1))
+            fi
+          done < <(
+            grep -E '^[[:space:]]*mount --bind \$MODDIR/' module/post-fs-data.sh \
+              | awk '{print $3}' \
+              | sed 's|^\$MODDIR/||'
+          )
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Build and verify module ZIP
+        id: build
+        run: |
+          mod_id=$(grep '^id=' module/module.prop | cut -d'=' -f2)
+          mod_ver=$(grep '^version=' module/module.prop | cut -d'=' -f2)
+          zip_name="${mod_id}-${mod_ver}.zip"
+          zip_path="${RUNNER_TEMP}/${zip_name}"
+
+          (cd module && zip -r9 "$zip_path" .)
+          unzip -t "$zip_path" >/dev/null
+
+          for required in module.prop post-fs-data.sh META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script; do
+            unzip -Z1 "$zip_path" | grep -qx "$required" || {
+              echo "::error::Missing '${required}' in built ZIP"
+              exit 1
+            }
+          done
+
+          zip_size=$(ls -lh "$zip_path" | awk '{print $5}')
+          echo "Built ${zip_name} (${zip_size})"
+          echo "zip_name=${zip_name}" >> "$GITHUB_OUTPUT"
+          echo "zip_path=${zip_path}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Build & Verify Passed"
+            echo "- **Module ID:** \`${mod_id}\`"
+            echo "- **Version:** \`${mod_ver}\`"
+            echo "- **Artifact:** \`${zip_name}\` (${zip_size})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload module ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.zip_name }}
+          path: ${{ steps.build.outputs.zip_path }}
+          retention-days: 7
+          if-no-files-found: error

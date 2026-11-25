@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         > [!NOTE]
-        > **KernelSU / APatch users:** If photos turn black right after capture (but Pro mode and video work), first try disabling **Umount modules** for the camera app (`com.oplus.camera`) in your manager's App Profile — no root grant needed. See the [README](https://github.com/kinginu/oneplus13t-fix-camera#known-issue-photos-turn-black-after-capture-kernelsu--apatch) for details. If that fixes it, please still submit a report and mention it below.
+        > **KernelSU / APatch users:** If photos turn black right after capture (but Pro mode and video work), first try disabling **Umount modules** for the camera app (`com.oplus.camera`) in your manager's App Profile — no root grant needed. See the [README](https://github.com/noxsk/oneplus13t-fix#known-issue-photos-turn-black-after-capture-kernelsu--apatch) for details. If that fixes it, please still submit a report and mention it below.
 
   - type: dropdown
     id: status

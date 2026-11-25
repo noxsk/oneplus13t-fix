@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "New version (e.g., CPH2723_16.0.8.301-r2)"
+        description: "New version (e.g., CPH2723_17.0.1.201-r2)"
         required: true
         type: string
       changelog_notes:
@@ -47,6 +47,15 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
+      - name: Verify tag does not already exist
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+        run: |
+          if git ls-remote --tags origin "refs/tags/${NEW_VERSION}" | grep -q "refs/tags/${NEW_VERSION}$"; then
+            echo "::error::Tag ${NEW_VERSION} already exists."
+            exit 1
+          fi
+
       - name: Initialize required files
         run: |
           [ -f update.json ] || echo '{}' > update.json
@@ -58,55 +67,75 @@ jobs:
           current_code=$(grep '^versionCode=' module/module.prop | cut -d'=' -f2)
           new_code=$((current_code + 1))
 
-          echo "Version code: $current_code -> $new_code"
-          echo "new_code=$new_code" >> "$GITHUB_OUTPUT"
+          echo "Version code: ${current_code} -> ${new_code}"
+          echo "new_code=${new_code}" >> "$GITHUB_OUTPUT"
 
       - name: Update module.prop
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+          NEW_CODE: ${{ steps.versioning.outputs.new_code }}
         run: |
-          sed -i "s/^version=.*/version=${{ inputs.version }}/" module/module.prop
-          sed -i "s/^versionCode=.*/versionCode=${{ steps.versioning.outputs.new_code }}/" module/module.prop
+          sed -i "s|^version=.*|version=${NEW_VERSION}|" module/module.prop
+          sed -i "s|^versionCode=.*|versionCode=${NEW_CODE}|" module/module.prop
 
       - name: Update update.json
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+          NEW_CODE: ${{ steps.versioning.outputs.new_code }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          ver="${{ inputs.version }}"
-          zip_url="https://github.com/kinginu/oneplus13t-fix-camera/releases/download/${ver}/oneplus13t-fix-camera-${ver}.zip"
+          zip_url="https://github.com/${REPO}/releases/download/${NEW_VERSION}/oneplus13t-fix-${NEW_VERSION}.zip"
+          changelog_url="https://raw.githubusercontent.com/${REPO}/${BRANCH}/changelog.md"
           jq \
-            --arg ver "$ver" \
-            --arg code "${{ steps.versioning.outputs.new_code }}" \
+            --arg ver "$NEW_VERSION" \
+            --arg code "$NEW_CODE" \
             --arg url "$zip_url" \
-            '.version = $ver | .versionCode = ($code | tonumber) | .zipUrl = $url' \
-            update.json > tmp.json && mv tmp.json update.json
+            --arg changelog "$changelog_url" \
+            '.version = $ver | .versionCode = ($code | tonumber) | .zipUrl = $url | .changelog = $changelog' \
+            update.json > "${RUNNER_TEMP}/update.json.tmp"
+          mv "${RUNNER_TEMP}/update.json.tmp" update.json
 
       - name: Update changelog.md
         env:
+          NEW_VERSION: ${{ inputs.version }}
           CHANGELOG_NOTES: ${{ inputs.changelog_notes }}
         run: |
           {
-            echo "## ${{ inputs.version }} ($(date +'%Y-%m-%d'))"
+            echo "## ${NEW_VERSION} ($(date -u +'%Y-%m-%d'))"
             echo
             printf "%s\n" "$CHANGELOG_NOTES"
             echo
-          } > new_entry.txt
-          cat new_entry.txt changelog.md > temp && mv temp changelog.md
+          } > "${RUNNER_TEMP}/new_entry.txt"
+          cat "${RUNNER_TEMP}/new_entry.txt" changelog.md > "${RUNNER_TEMP}/changelog.tmp"
+          mv "${RUNNER_TEMP}/changelog.tmp" changelog.md
 
       - name: Commit changes
+        env:
+          NEW_VERSION: ${{ inputs.version }}
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add module/module.prop update.json changelog.md
-          git commit -m "chore: bump version to ${{ inputs.version }}"
+          git commit -m "chore: bump version to ${NEW_VERSION}"
           git push
 
       - name: Create tag
+        env:
+          NEW_VERSION: ${{ inputs.version }}
         run: |
-          git tag "${{ inputs.version }}"
-          git push origin "${{ inputs.version }}"
+          git tag "$NEW_VERSION"
+          git push origin "$NEW_VERSION"
 
       - name: Build module ZIP
         id: build_zip
+        env:
+          NEW_VERSION: ${{ inputs.version }}
         run: |
-          zip_name="oneplus13t-fix-camera-${{ inputs.version }}.zip"
-          (cd module && zip -r9 "../${zip_name}" .)
+          zip_name="oneplus13t-fix-${NEW_VERSION}.zip"
+          zip_path="${RUNNER_TEMP}/${zip_name}"
+          (cd module && zip -r9 "$zip_path" .)
+          echo "zip_path=${zip_path}" >> "$GITHUB_OUTPUT"
           echo "zip_name=${zip_name}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release notes
@@ -123,14 +152,26 @@ jobs:
               echo
               printf "%s\n" "$NOTES_FOOTER"
             fi
-          } > RELEASE_BODY.md
+          } > "${RUNNER_TEMP}/RELEASE_BODY.md"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.version }}
-          name: "Module for ${{ inputs.version }}"
+          name: "oneplus13t-fix ${{ inputs.version }}"
           files: |
-            ${{ steps.build_zip.outputs.zip_name }}
-          body_path: RELEASE_BODY.md
+            ${{ steps.build_zip.outputs.zip_path }}
+          body_path: ${{ runner.temp }}/RELEASE_BODY.md
           fail_on_unmatched_files: true
+
+      - name: Write release summary
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+          NEW_CODE: ${{ steps.versioning.outputs.new_code }}
+          ZIP_NAME: ${{ steps.build_zip.outputs.zip_name }}
+        run: |
+          {
+            echo "### Release Published"
+            echo "- **Version:** \`${NEW_VERSION}\` (versionCode \`${NEW_CODE}\`)"
+            echo "- **Artifact:** \`${ZIP_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
