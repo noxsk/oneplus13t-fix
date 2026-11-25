@@ -258,7 +258,8 @@
             "com.tencent.mm.plugin.appbrand.ui.AppBrandUI03",
             "com.tencent.mm.plugin.appbrand.ui.AppBrandUI04",
             "com.tencent.mm.plugin.flash.FaceFlashUI",
-            "com.tencent.mm.plugin.flash.action.FaceFlashActionUI"
+            "com.tencent.mm.plugin.flash.action.FaceFlashActionUI",
+            "com.tencent.cloud.huiyan.activities.MainAuthActivity"
         ],
         "app_enable_fb_activity": [
             "com.tencent.mm.ui.LauncherUI",
@@ -445,6 +446,7 @@
             "com.whatsapp.camera.ui.CameraActivity",
             "com.whatsapp.HomeActivity",
             "com.whatsapp.qrcode.contactqr.ContactQrActivity",
+            "com.whatsapp.qrcode.ui.contactqr.ContactQrActivity",
             "com.whatsapp.statuscomposer.ConsolidatedStatusComposerActivity",
             "com.whatsapp.status.composer.ConsolidatedStatusComposerActivity"
         ],
