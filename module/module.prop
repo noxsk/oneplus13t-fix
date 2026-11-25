@@ -1,7 +1,7 @@
 id=oneplus13t-fix
 name=OnePlus 13T Fix for OxygenOS
-version=CPH2723_17.0.0.101
-versionCode=17
+version=CPH2723_17.0.1.201
+versionCode=18
 author=noxsk
 description=Fix camera and battery capacity for OnePlus 13T on OxygenOS.
 updateJson=https://raw.githubusercontent.com/noxsk/oneplus13t-fix/main/update.json
