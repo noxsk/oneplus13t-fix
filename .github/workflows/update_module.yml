@@ -16,15 +16,17 @@ on:
         default: ""
         type: string
       cos_version:
-        description: "Source COS Version (e.g., PKX110_17.0.1.201)"
-        required: true
+        description: "Source COS Version (e.g., PKX110_17.0.1.201; leave blank with cos_ota_url to auto-detect latest)"
+        required: false
+        default: ""
         type: string
       cos_ota_url:
-        description: "Source COS Full OTA URL"
-        required: true
+        description: "Source COS Full OTA URL (supports direct .zip or Oplus downloadCheck URL; leave blank to auto-fetch latest CN full OTA)"
+        required: false
+        default: ""
         type: string
       cos_ota_md5:
-        description: "Optional MD5 checksum for COS Full OTA verification"
+        description: "Optional MD5 checksum for COS Full OTA verification (auto-filled when auto-fetching)"
         required: false
         default: ""
         type: string
@@ -71,10 +73,73 @@ jobs:
     needs: check-tag
     if: needs.check-tag.outputs.exists == 'false'
     runs-on: ubuntu-latest
+    outputs:
+      cos_version: ${{ steps.resolve_ota.outputs.cos_version }}
     env:
       RELEASE_TAG: ${{ needs.check-tag.outputs.release_tag }}
 
     steps:
+      - name: Resolve COS OTA metadata
+        id: resolve_ota
+        env:
+          INPUT_COS_VERSION: ${{ inputs.cos_version }}
+          INPUT_COS_OTA_URL: ${{ inputs.cos_ota_url }}
+          INPUT_COS_OTA_MD5: ${{ inputs.cos_ota_md5 }}
+        run: |
+          trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+          cos_version=$(trim "$INPUT_COS_VERSION")
+          cos_ota_url=$(trim "$INPUT_COS_OTA_URL")
+          cos_ota_md5=$(trim "$INPUT_COS_OTA_MD5")
+          auto_fetched="false"
+
+          if [ -z "$cos_ota_url" ]; then
+            echo "cos_ota_url not provided; querying latest OnePlus 13T (CN) full OTA..."
+            api_json=$(curl -fsSL --retry 3 "https://oosdownloader-gui.fly.dev/api/oneplus/oneplus_13t/CN/full/info")
+
+            api_version_raw=$(printf '%s' "$api_json" | jq -r '.version_number // empty')
+            api_version_clean="${api_version_raw%%(*}"
+            cos_ota_url=$(printf '%s' "$api_json" | jq -r '.download_url // empty')
+            api_md5=$(printf '%s' "$api_json" | jq -r '.md5sum // empty')
+
+            if [ -z "$cos_ota_url" ] || [ -z "$api_version_raw" ]; then
+              echo "::error::Failed to fetch latest OnePlus 13T CN OTA metadata from API."
+              exit 1
+            fi
+
+            if [ -n "$cos_version" ]; then
+              expected_clean="${cos_version%%(*}"
+              if [ "$api_version_clean" != "$expected_clean" ]; then
+                echo "::error::Requested cos_version '${cos_version}' does not match latest API version '${api_version_raw}'. Please provide cos_ota_url manually for an older build."
+                exit 1
+              fi
+              cos_version="$expected_clean"
+            else
+              cos_version="$api_version_clean"
+            fi
+
+            if [ -z "$cos_ota_md5" ] && [ -n "$api_md5" ]; then
+              cos_ota_md5="$api_md5"
+            fi
+            auto_fetched="true"
+          else
+            if [ -z "$cos_version" ]; then
+              echo "::error::cos_version is required when cos_ota_url is provided manually."
+              exit 1
+            fi
+            cos_version="${cos_version%%(*}"
+          fi
+
+          echo "Resolved COS Version: ${cos_version}"
+          echo "Resolved COS MD5: ${cos_ota_md5:-<none>}"
+          echo "Auto-fetched from API: ${auto_fetched}"
+
+          echo "cos_version=${cos_version}" >> "$GITHUB_OUTPUT"
+          echo "cos_version=${cos_version}" >> "$GITHUB_ENV"
+          echo "cos_ota_url=${cos_ota_url}" >> "$GITHUB_ENV"
+          echo "cos_ota_md5=${cos_ota_md5}" >> "$GITHUB_ENV"
+          echo "auto_fetched=${auto_fetched}" >> "$GITHUB_ENV"
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -118,22 +183,71 @@ jobs:
           df -h
 
       - name: Download COS Full OTA
-        env:
-          COS_OTA_URL: ${{ inputs.cos_ota_url }}
-          COS_OTA_MD5: ${{ inputs.cos_ota_md5 }}
         run: |
-          echo "Downloading ColorOS OTA package..."
-          aria2c \
-            -x16 -s16 -k1M \
-            --file-allocation=none \
-            --max-tries=5 --retry-wait=3 \
-            -c -d "${WORK_DIR}" -o "cos.zip" \
-            "$COS_OTA_URL"
+          resolve_download_url() {
+            local src_url="$1"
+            if [[ "$src_url" == *"downloadCheck"* ]]; then
+              local resolved
+              resolved=$(
+                curl -fsSI --retry 3 \
+                  -H "User-Agent: okhttp/3.12.12" \
+                  -H "userId: oplus-ota|16002018" \
+                  "$src_url" \
+                | awk 'tolower($1)=="location:" {sub(/\r$/, "", $2); print $2; exit}'
+              )
+              if [ -z "$resolved" ]; then
+                echo "::error::Failed to resolve 302 redirect from Oplus downloadCheck URL." >&2
+                return 1
+              fi
+              printf '%s' "$resolved"
+            else
+              printf '%s' "$src_url"
+            fi
+          }
+
+          source_url="${cos_ota_url}"
+          downloaded=false
+
+          for attempt in 1 2 3 4; do
+            echo "Downloading ColorOS OTA package (attempt ${attempt}/4)..."
+            if [ "$attempt" -gt 1 ] && [ "${auto_fetched}" = "true" ]; then
+              fresh_url=$(
+                curl -fsSL --retry 3 "https://oosdownloader-gui.fly.dev/api/oneplus/oneplus_13t/CN/full/info" \
+                | jq -r '.download_url // empty'
+              )
+              if [ -n "$fresh_url" ]; then
+                source_url="$fresh_url"
+              fi
+            fi
+
+            download_url=$(resolve_download_url "$source_url")
+            echo "Resolved CDN host: $(printf '%s' "$download_url" | awk -F/ '{print $3}')"
+
+            if aria2c \
+              -x16 -s16 -k1M \
+              --file-allocation=none \
+              --allow-overwrite=true \
+              --auto-file-renaming=false \
+              --max-tries=3 --retry-wait=3 \
+              -c -d "${WORK_DIR}" -o "cos.zip" \
+              "$download_url"; then
+              downloaded=true
+              break
+            fi
+
+            echo "Download interrupted on attempt ${attempt}; refreshing signed URL and resuming..."
+            sleep 2
+          done
+
+          if [ "$downloaded" != "true" ]; then
+            echo "::error::Failed to download ColorOS OTA after 4 attempts."
+            exit 1
+          fi
 
           ls -lh "${WORK_DIR}/cos.zip"
 
-          if [ -n "$COS_OTA_MD5" ]; then
-            expected_md5=$(printf '%s' "$COS_OTA_MD5" | tr '[:upper:]' '[:lower:]')
+          if [ -n "${cos_ota_md5}" ]; then
+            expected_md5=$(printf '%s' "${cos_ota_md5}" | tr '[:upper:]' '[:lower:]')
             actual_md5=$(md5sum "${WORK_DIR}/cos.zip" | awk '{print $1}')
             echo "MD5 check: expected=${expected_md5} actual=${actual_md5}"
             if [ "$actual_md5" != "$expected_md5" ]; then
@@ -149,8 +263,6 @@ jobs:
           echo "odm_img_path=${WORK_DIR}/odm_cos.img" >> "$GITHUB_ENV"
 
       - name: Update ODM files
-        env:
-          COS_VERSION: ${{ inputs.cos_version }}
         run: |
           source .github/scripts/extract_odm_lib.sh
 
@@ -164,7 +276,7 @@ jobs:
           {
             echo "## Update: ${RELEASE_TAG}"
             echo "- **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo "- **Source COS:** ${COS_VERSION}"
+            echo "- **Source COS:** ${cos_version}"
             echo "- **Changes:**"
             echo '```diff'
           } > "$CURRENT_REPORT"
@@ -236,15 +348,15 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       version: ${{ needs.check-tag.outputs.release_tag }}
-      changelog_notes: "* Update ODM blobs from COS: ${{ inputs.cos_version }}"
+      changelog_notes: "* Update ODM blobs from COS: ${{ needs.update-odm.outputs.cos_version }}"
       release_notes_footer: |
         ---
         ### Build Info
         - **Target Version:** `${{ needs.check-tag.outputs.release_tag }}`
-        - **Source COS Version:** `${{ inputs.cos_version }}`
+        - **Source COS Version:** `${{ needs.update-odm.outputs.cos_version }}`
 
   record-history:
-    needs: [check-tag, release]
+    needs: [check-tag, update-odm, release]
     runs-on: ubuntu-latest
 
     steps:
@@ -267,7 +379,7 @@ jobs:
       - name: Update OTA history
         env:
           TAG_VER: ${{ needs.check-tag.outputs.release_tag }}
-          COS_VER: ${{ inputs.cos_version }}
+          COS_VER: ${{ needs.update-odm.outputs.cos_version }}
         run: |
           mkdir -p .github/logs
           [ -f .github/logs/ota_history.yml ] || echo "[]" > .github/logs/ota_history.yml
